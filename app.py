@@ -118,6 +118,22 @@ def parse_json_response(text: str) -> dict:
         raise
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
+SLIDE_FILTER_PROMPT = """You are filtering lecture slides for a CMPSC 311 (Systems Programming) study tool.
+
+Classify this slide as "study" or "skip".
+
+SKIP if ANY of these apply:
+- Title/intro slide: just has the course name, lecture topic name, a quote, or memes — no academic content
+- Course logistics: talks about how THIS CLASS works, what you will do in 473, grading, structure
+- Pure teaser: ends with a question like "so how do we do X?" with no actual answer on the slide
+- Redundant animation step: this slide shows a partial/intermediate state of a diagram or concept list that is clearly continued and completed on the next slide (the next slide will have everything this slide has plus more)
+- Administrative: office hours, announcements, "questions?", agenda slides
+
+STUDY if: it contains definitions, facts, code, mechanisms, or relationships that could appear on an exam.
+When in doubt, choose study.
+
+Return ONLY valid JSON (no markdown): {"action": "study"} or {"action": "skip", "reason": "one sentence"}"""
+
 EXTRACTION_PROMPT = """You are in EXAM WRITER MODE for CMPSC 311 (Systems Programming / Intro to C and OS).
 
 Analyze this lecture slide (image + extracted text) and extract EVERY discrete concept.
@@ -196,6 +212,36 @@ Respond with ONLY valid JSON (no markdown fences):
 follow_up_questions must be empty array [] if score >= 8."""
 
 # ── Pipeline (sync, runs in background thread) ────────────────────────────────
+def should_skip_slide(slide_num: int, text_lines: list[str], image_path: str, total_slides: int) -> bool:
+    """Returns True if this slide should be skipped (no concept extraction or questions)."""
+    if slide_num == 1:
+        print(f"  Slide {slide_num}: skipped (title slide)")
+        return True
+    if len([l for l in text_lines if l.strip()]) < 2:
+        print(f"  Slide {slide_num}: skipped (too sparse)")
+        return True
+    try:
+        import base64 as _b64
+        with open(image_path, "rb") as f:
+            img_b64 = _b64.b64encode(f.read()).decode()
+        text_block = "\n".join(text_lines) or "(no text)"
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=60,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                {"type": "text", "text": f"{SLIDE_FILTER_PROMPT}\n\nSlide {slide_num} of {total_slides}. Text:\n{text_block}"}
+            ]}]
+        )
+        result = parse_json_response(msg.content[0].text)
+        skip = result.get("action") == "skip"
+        if skip:
+            print(f"  Slide {slide_num}: skipped — {result.get('reason', 'classified as skip')}")
+        return skip
+    except Exception as e:
+        print(f"  Slide {slide_num}: filter error ({e}), defaulting to study")
+        return False
+
 def extract_concepts_sync(slide_text: list[str], image_path: str, slide_num: int) -> list[dict]:
     try:
         with open(image_path, "rb") as f:
@@ -249,7 +295,6 @@ def process_pdf_background(deck_id: int, pdf_path: str):
 
         for i, page in enumerate(doc):
             slide_num = i + 1
-            print(f"  Slide {slide_num}/{total}")
 
             mat = fitz.Matrix(1.5, 1.5)
             pix = page.get_pixmap(matrix=mat)
@@ -259,6 +304,7 @@ def process_pdf_background(deck_id: int, pdf_path: str):
             raw_text = page.get_text("text")
             cleaned = clean_text(raw_text)
 
+            # Always record the slide so thumbnails work in the map view
             cur = conn.execute(
                 "INSERT INTO slides (deck_id, slide_number, text_content, image_path) VALUES (?,?,?,?)",
                 (deck_id, slide_num, "\n".join(cleaned), img_path)
@@ -266,6 +312,12 @@ def process_pdf_background(deck_id: int, pdf_path: str):
             slide_id = cur.lastrowid
             conn.commit()
 
+            if should_skip_slide(slide_num, cleaned, img_path, total):
+                conn.execute("UPDATE decks SET processed_slides=? WHERE id=?", (slide_num, deck_id))
+                conn.commit()
+                continue
+
+            print(f"  Slide {slide_num}/{total}: extracting concepts...")
             concepts = extract_concepts_sync(cleaned, img_path, slide_num)
             if not concepts:
                 conn.execute("UPDATE decks SET processed_slides=? WHERE id=?", (slide_num, deck_id))
