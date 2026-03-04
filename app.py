@@ -118,21 +118,39 @@ def parse_json_response(text: str) -> dict:
         raise
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
-SLIDE_FILTER_PROMPT = """You are filtering lecture slides for a CMPSC 311 (Systems Programming) study tool.
+GROUP_PROMPT = """You are organizing a CMPSC 311 (Systems Programming) lecture slide deck into study groups.
 
-Classify this slide as "study" or "skip".
+Your job: group consecutive slides that cover the same topic, concept, or animated sequence into one unit.
 
-SKIP if ANY of these apply:
-- Title/intro slide: just has the course name, lecture topic name, a quote, or memes — no academic content
-- Course logistics: talks about how THIS CLASS works, what you will do in 473, grading, structure
-- Pure teaser: ends with a question like "so how do we do X?" with no actual answer on the slide
-- Redundant animation step: this slide shows a partial/intermediate state of a diagram or concept list that is clearly continued and completed on the next slide (the next slide will have everything this slide has plus more)
-- Administrative: office hours, announcements, "questions?", agenda slides
+Rules for grouping:
+- Animation/build sequences: when the professor shows the same diagram/code building up over multiple slides (e.g., "Dynamic Memory in action" slides 1-4 where each slide adds one more arrow or label) → ONE group, anchor = the LAST slide (most complete state)
+- Same topic, multiple slides: e.g., "The Heap" across 3 slides introducing then expanding → ONE group
+- Clear topic change: new header/title that introduces a different concept → new group
+- Single standalone slide: fine as its own group
 
-STUDY if: it contains definitions, facts, code, mechanisms, or relationships that could appear on an exam.
-When in doubt, choose study.
+Action per group:
+- "skip": title-only slides (course name + lecture topic + maybe a meme), pure administrative/logistics slides that talk about course structure ("in this class we will...", "in 473 you will..."), office hours, agenda
+- "study": anything with definitions, code, mechanisms, diagrams, or facts that could appear on an exam
 
-Return ONLY valid JSON (no markdown): {"action": "study"} or {"action": "skip", "reason": "one sentence"}"""
+IMPORTANT: Every slide number must appear in exactly one group. Do not drop any slides.
+
+Return ONLY valid JSON (no markdown fences):
+{
+  "groups": [
+    {
+      "slides": [1],
+      "anchor": 1,
+      "topic": "brief topic name",
+      "action": "skip"
+    },
+    {
+      "slides": [2, 3, 4],
+      "anchor": 4,
+      "topic": "Static vs automatic memory allocation",
+      "action": "study"
+    }
+  ]
+}"""
 
 EXTRACTION_PROMPT = """You are in EXAM WRITER MODE for CMPSC 311 (Systems Programming / Intro to C and OS).
 
