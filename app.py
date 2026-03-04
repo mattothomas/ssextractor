@@ -217,18 +217,26 @@ def extract_concepts_sync(slide_text: list[str], image_path: str, slide_num: int
 def generate_questions_sync(concepts: list[dict]) -> list[dict]:
     if not concepts:
         return []
-    try:
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=4000,
-            messages=[{"role": "user", "content":
-                f"{QUESTION_PROMPT}\n\nConcepts:\n{json.dumps(concepts, indent=2)}"
-            }]
-        )
-        return parse_json_response(msg.content[0].text).get("questions", [])
-    except Exception as e:
-        print(f"  [!] Question generation error: {e}")
-        return []
+    all_questions = []
+    BATCH = 3
+    for i in range(0, len(concepts), BATCH):
+        batch = concepts[i:i + BATCH]
+        try:
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=4096,
+                messages=[{"role": "user", "content":
+                    f"{QUESTION_PROMPT}\n\nConcepts:\n{json.dumps(batch, indent=2)}"
+                }]
+            )
+            batch_qs = parse_json_response(msg.content[0].text).get("questions", [])
+            for q in batch_qs:
+                q["concept_index"] = i + q.get("concept_index", 0)
+            all_questions.extend(batch_qs)
+        except Exception as e:
+            print(f"  [!] Question generation error (batch {i // BATCH + 1}): {e}")
+            continue
+    return all_questions
 
 def process_pdf_background(deck_id: int, pdf_path: str):
     conn = get_db()
