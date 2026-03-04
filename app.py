@@ -309,6 +309,33 @@ def generate_questions_sync(concepts: list[dict]) -> list[dict]:
             continue
     return all_questions
 
+def _store_group_questions(conn, concepts: list[dict], anchor_slide_id: int, deck_id: int):
+    """Insert concepts + questions + mastery rows for one group."""
+    concept_ids = []
+    for c in concepts:
+        cur = conn.execute(
+            "INSERT INTO concepts (slide_id, deck_id, concept, explanation, type) VALUES (?,?,?,?,?)",
+            (anchor_slide_id, deck_id, c.get("concept",""), c.get("explanation",""), c.get("type","definition"))
+        )
+        concept_ids.append(cur.lastrowid)
+    conn.commit()
+
+    questions = generate_questions_sync(concepts)
+    for q in questions:
+        ci = min(q.get("concept_index", 0), len(concept_ids) - 1)
+        cur = conn.execute(
+            "INSERT INTO questions (concept_id, slide_id, deck_id, mcq_json, short_answer_json, applied_json) VALUES (?,?,?,?,?,?)",
+            (concept_ids[ci], anchor_slide_id, deck_id,
+             json.dumps(q["mcq"])         if q.get("mcq")          else None,
+             json.dumps(q["short_answer"]) if q.get("short_answer") else None,
+             json.dumps(q["applied"])      if q.get("applied")      else None)
+        )
+        q_id = cur.lastrowid
+        for qt in ("mcq", "short_answer", "applied"):
+            conn.execute("INSERT OR IGNORE INTO mastery (question_id, question_type) VALUES (?,?)", (q_id, qt))
+    conn.commit()
+    return len(questions)
+
 def process_pdf_background(deck_id: int, pdf_path: str):
     conn = get_db()
     try:
@@ -316,76 +343,80 @@ def process_pdf_background(deck_id: int, pdf_path: str):
         total = len(doc)
         conn.execute("UPDATE decks SET total_slides=?, status='processing' WHERE id=?", (total, deck_id))
         conn.commit()
-        print(f"[Deck {deck_id}] Processing {total} slides...")
+        print(f"[Deck {deck_id}] Phase 1: Rendering {total} slides...")
 
+        # ── Phase 1: Render all slides, extract text, store in DB ─────────────
+        all_slide_data = []
         for i, page in enumerate(doc):
             slide_num = i + 1
-
             mat = fitz.Matrix(1.5, 1.5)
             pix = page.get_pixmap(matrix=mat)
             img_path = str(IMAGE_DIR / f"d{deck_id}_s{slide_num}.png")
             pix.save(img_path)
 
             raw_text = page.get_text("text")
-            cleaned = clean_text(raw_text)
+            cleaned  = clean_text(raw_text)
 
-            # Always record the slide so thumbnails work in the map view
             cur = conn.execute(
                 "INSERT INTO slides (deck_id, slide_number, text_content, image_path) VALUES (?,?,?,?)",
                 (deck_id, slide_num, "\n".join(cleaned), img_path)
             )
-            slide_id = cur.lastrowid
-            conn.commit()
+            all_slide_data.append({
+                "slide_number": slide_num,
+                "slide_id":     cur.lastrowid,
+                "img_path":     img_path,
+                "text_lines":   cleaned,
+            })
+        conn.commit()
 
-            if should_skip_slide(slide_num, cleaned, img_path, total):
-                conn.execute("UPDATE decks SET processed_slides=? WHERE id=?", (slide_num, deck_id))
-                conn.commit()
+        # ── Phase 2: Group all slides by topic (one API call, text-only) ──────
+        print(f"[Deck {deck_id}] Phase 2: Grouping slides by topic...")
+        slide_texts = [{"slide_number": s["slide_number"], "text": "\n".join(s["text_lines"])}
+                       for s in all_slide_data]
+        groups = group_slides_sync(slide_texts)
+        slide_lookup = {s["slide_number"]: s for s in all_slide_data}
+
+        study_groups = [g for g in groups if g.get("action") == "study"]
+        skip_groups  = [g for g in groups if g.get("action") != "study"]
+        print(f"[Deck {deck_id}] {len(study_groups)} study groups, {len(skip_groups)} skipped")
+        for sg in skip_groups:
+            print(f"  Skipped: slides {sg['slides']} — {sg.get('topic','')}")
+
+        # ── Phase 3: Process each study group ─────────────────────────────────
+        print(f"[Deck {deck_id}] Phase 3: Processing {len(study_groups)} groups...")
+        for gi, group in enumerate(study_groups):
+            anchor_num  = group.get("anchor")
+            topic       = group.get("topic", f"Group {gi+1}")
+            slide_nums  = group.get("slides", [anchor_num])
+
+            if anchor_num not in slide_lookup:
                 continue
+            anchor = slide_lookup[anchor_num]
 
-            print(f"  Slide {slide_num}/{total}: extracting concepts...")
-            concepts = extract_concepts_sync(cleaned, img_path, slide_num)
-            if not concepts:
-                conn.execute("UPDATE decks SET processed_slides=? WHERE id=?", (slide_num, deck_id))
-                conn.commit()
-                continue
+            # Combine text from all slides in the group, deduped, preserving order
+            seen_lines, combined = set(), []
+            for sn in slide_nums:
+                for line in slide_lookup.get(sn, {}).get("text_lines", []):
+                    if line not in seen_lines:
+                        seen_lines.add(line)
+                        combined.append(line)
 
-            concept_ids = []
-            for c in concepts:
-                cur = conn.execute(
-                    "INSERT INTO concepts (slide_id, deck_id, concept, explanation, type) VALUES (?,?,?,?,?)",
-                    (slide_id, deck_id, c.get("concept",""), c.get("explanation",""), c.get("type","definition"))
-                )
-                concept_ids.append(cur.lastrowid)
+            print(f"  Group {gi+1}/{len(study_groups)}: '{topic}' (slides {slide_nums}, anchor {anchor_num})")
+            concepts = extract_concepts_sync(combined, anchor["img_path"], topic)
+
+            if concepts:
+                n_q = _store_group_questions(conn, concepts, anchor["slide_id"], deck_id)
+                print(f"    → {len(concepts)} concepts, {n_q} question sets")
+
+            conn.execute("UPDATE decks SET processed_slides=? WHERE id=?", (anchor_num, deck_id))
             conn.commit()
 
-            questions = generate_questions_sync(concepts)
-            for q in questions:
-                ci = min(q.get("concept_index", 0), len(concept_ids) - 1)
-                cur = conn.execute(
-                    "INSERT INTO questions (concept_id, slide_id, deck_id, mcq_json, short_answer_json, applied_json) VALUES (?,?,?,?,?,?)",
-                    (
-                        concept_ids[ci], slide_id, deck_id,
-                        json.dumps(q["mcq"]) if q.get("mcq") else None,
-                        json.dumps(q["short_answer"]) if q.get("short_answer") else None,
-                        json.dumps(q["applied"]) if q.get("applied") else None,
-                    )
-                )
-                q_id = cur.lastrowid
-                for qt in ("mcq", "short_answer", "applied"):
-                    conn.execute(
-                        "INSERT OR IGNORE INTO mastery (question_id, question_type) VALUES (?,?)",
-                        (q_id, qt)
-                    )
-            conn.commit()
-
-            conn.execute("UPDATE decks SET processed_slides=? WHERE id=?", (slide_num, deck_id))
-            conn.commit()
-
-        conn.execute("UPDATE decks SET status='done' WHERE id=?", (deck_id,))
+        conn.execute("UPDATE decks SET processed_slides=total_slides, status='done' WHERE id=?", (deck_id,))
         conn.commit()
         print(f"[Deck {deck_id}] Done.")
     except Exception as e:
         print(f"[Deck {deck_id}] Error: {e}")
+        import traceback; traceback.print_exc()
         conn.execute("UPDATE decks SET status='error' WHERE id=?", (deck_id,))
         conn.commit()
     finally:
