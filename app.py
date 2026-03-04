@@ -230,52 +230,59 @@ Respond with ONLY valid JSON (no markdown fences):
 follow_up_questions must be empty array [] if score >= 8."""
 
 # ── Pipeline (sync, runs in background thread) ────────────────────────────────
-def should_skip_slide(slide_num: int, text_lines: list[str], image_path: str, total_slides: int) -> bool:
-    """Returns True if this slide should be skipped (no concept extraction or questions)."""
-    if slide_num == 1:
-        print(f"  Slide {slide_num}: skipped (title slide)")
-        return True
-    if len([l for l in text_lines if l.strip()]) < 2:
-        print(f"  Slide {slide_num}: skipped (too sparse)")
-        return True
+def group_slides_sync(slide_texts: list[dict]) -> list[dict]:
+    """
+    slide_texts: list of {slide_number, text}
+    Returns list of group dicts: {slides, anchor, topic, action}
+    """
+    all_nums   = [s["slide_number"] for s in slide_texts]
+    slides_block = "\n\n".join(
+        f"=== Slide {s['slide_number']} ===\n{s['text'] or '(no text)'}"
+        for s in slide_texts
+    )
+    try:
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            messages=[{"role": "user", "content":
+                f"{GROUP_PROMPT}\n\nTotal slides: {len(slide_texts)}\nSlide numbers: {all_nums}\n\n{slides_block}"
+            }]
+        )
+        groups = parse_json_response(msg.content[0].text).get("groups", [])
+        # Ensure every slide appears in exactly one group
+        seen = {s for g in groups for s in g.get("slides", [])}
+        for n in all_nums:
+            if n not in seen:
+                groups.append({"slides": [n], "anchor": n, "topic": f"Slide {n}", "action": "study"})
+        return groups
+    except Exception as e:
+        print(f"  [!] Grouping error: {e} — defaulting to one group per slide")
+        return [
+            {"slides": [s["slide_number"]], "anchor": s["slide_number"],
+             "topic": f"Slide {s['slide_number']}",
+             "action": "skip" if s["slide_number"] == 1 else "study"}
+            for s in slide_texts
+        ]
+
+def extract_concepts_sync(combined_text: list[str], image_path: str, group_label: str) -> list[dict]:
+    """Extract concepts from a group of slides. Uses anchor slide image + combined text."""
     try:
         import base64 as _b64
         with open(image_path, "rb") as f:
             img_b64 = _b64.b64encode(f.read()).decode()
-        text_block = "\n".join(text_lines) or "(no text)"
-        msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=60,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                {"type": "text", "text": f"{SLIDE_FILTER_PROMPT}\n\nSlide {slide_num} of {total_slides}. Text:\n{text_block}"}
-            ]}]
-        )
-        result = parse_json_response(msg.content[0].text)
-        skip = result.get("action") == "skip"
-        if skip:
-            print(f"  Slide {slide_num}: skipped — {result.get('reason', 'classified as skip')}")
-        return skip
-    except Exception as e:
-        print(f"  Slide {slide_num}: filter error ({e}), defaulting to study")
-        return False
-
-def extract_concepts_sync(slide_text: list[str], image_path: str, slide_num: int) -> list[dict]:
-    try:
-        with open(image_path, "rb") as f:
-            img_b64 = __import__('base64').b64encode(f.read()).decode()
-        text_block = "\n".join(slide_text) or "(no extractable text)"
+        text_block = "\n".join(combined_text) or "(no extractable text)"
+        context = f"Topic: {group_label}\n\nCombined text from this slide group:\n{text_block}"
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2000,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                {"type": "text", "text": f"{EXTRACTION_PROMPT}\n\nExtracted text:\n{text_block}"}
+                {"type": "text", "text": f"{EXTRACTION_PROMPT}\n\n{context}"}
             ]}]
         )
         return parse_json_response(msg.content[0].text).get("concepts", [])
     except Exception as e:
-        print(f"  [!] Concept extraction error slide {slide_num}: {e}")
+        print(f"  [!] Concept extraction error ({group_label}): {e}")
         return []
 
 def generate_questions_sync(concepts: list[dict]) -> list[dict]:
