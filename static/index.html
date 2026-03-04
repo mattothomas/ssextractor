@@ -400,12 +400,13 @@ async function startStudy(deckId, name) {
   await loadNextQuestion();
 }
 
-async function loadNextQuestion() {
+async function loadNextQuestion(targetSlide = null) {
   S.answerSubmitted = false;
   S.attempt = 1;
   S.followupAnswers = {};
   document.getElementById('study-card').innerHTML = '<div style="padding:40px;text-align:center"><div class="spinner" style="margin:0 auto"></div></div>';
-  const q = await api(`/study/next/${S.deckId}`);
+  const url = targetSlide ? `/study/next/${S.deckId}?slide=${targetSlide}` : `/study/next/${S.deckId}`;
+  const q = await api(url);
   if (q.done) {
     document.getElementById('study-card').innerHTML = `
       <div class="mastery-complete">
@@ -577,10 +578,25 @@ function renderFeedback(r, qtype, userAnswer) {
   document.getElementById('feedback-area').innerHTML = html;
   document.getElementById('feedback-area').style.display = '';
 
+  // Refresh mastery % from server after grading
+  api(`/deck/${S.deckId}/status`).then(d => {
+    const total = d.total_questions || 0;
+    // Fetch fresh mastery count
+    api(`/decks`).then(decks => {
+      const deck = decks.find(x => x.id === S.deckId);
+      if (!deck) return;
+      const pct = deck.total_questions ? Math.round(deck.mastered_questions / deck.total_questions * 100) : 0;
+      document.getElementById('study-prog-pill').textContent = `${pct}% mastered`;
+      document.getElementById('study-prog-pill').className = 'pill ' + (pct >= 80 ? 'green' : pct >= 40 ? 'yellow' : 'accent');
+    });
+  });
+
   // Update action buttons
   const actionsEl = document.getElementById('submit-btn').parentElement;
   if (qtype === 'mcq') {
-    actionsEl.innerHTML = `<button class="btn btn-primary" onclick="loadNextQuestion()">Next Question →</button>`;
+    // MCQ: auto-advance after 1.5s so they can read the explanation
+    setTimeout(() => { if (S.answerSubmitted) loadNextQuestion(); }, 1500);
+    actionsEl.innerHTML = `<button class="btn btn-primary" onclick="loadNextQuestion()">Next →</button>`;
   } else if (score >= 8) {
     actionsEl.innerHTML = `
       <button class="btn btn-primary" onclick="loadNextQuestion()">Next Question →</button>
@@ -588,7 +604,7 @@ function renderFeedback(r, qtype, userAnswer) {
   } else if (S.attempt >= 3) {
     actionsEl.innerHTML = `
       <button class="btn btn-primary" onclick="loadNextQuestion()">Move On →</button>
-      <div style="font-size:12px;color:var(--sub);display:flex;align-items:center">3 attempts reached — will resurface later</div>`;
+      <div style="font-size:12px;color:var(--sub);display:flex;align-items:center">3 attempts — will resurface later</div>`;
   } else {
     actionsEl.innerHTML = `
       <button class="btn btn-primary" onclick="retryAnswer()">Try Again (${3 - S.attempt} left)</button>
@@ -669,9 +685,11 @@ async function loadMap(deckId) {
   }
 }
 
-function jumpToSlide(slideNum) {
-  // For now, go to study mode — in future could filter to that slide
-  showStudy();
+async function jumpToSlide(slideNum) {
+  show('study-view');
+  document.getElementById('study-deck-label').textContent = S.deckName;
+  setHeader('', true);
+  await loadNextQuestion(slideNum);
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────

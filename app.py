@@ -423,10 +423,16 @@ def process_pdf_background(deck_id: int, pdf_path: str):
         conn.close()
 
 # ── Study Logic ───────────────────────────────────────────────────────────────
-def get_next_question(deck_id: int) -> Optional[dict]:
+def get_next_question(deck_id: int, target_slide: int = None) -> Optional[dict]:
     conn = get_db()
     try:
-        row = conn.execute("""
+        # Skip mastery rows where the corresponding JSON column is NULL
+        # (can happen if question generation partially failed)
+        # Order: MCQ sweep across all slides → short_answer sweep → applied sweep
+        # Within each type: unstarted first, then weakest, in slide order
+        where_slide = "AND s.slide_number = ?" if target_slide else ""
+        params = (deck_id, target_slide) if target_slide else (deck_id,)
+        row = conn.execute(f"""
             SELECT
                 q.id AS question_id,
                 q.mcq_json, q.short_answer_json, q.applied_json,
@@ -438,13 +444,19 @@ def get_next_question(deck_id: int) -> Optional[dict]:
             JOIN concepts c ON q.concept_id = c.id
             JOIN mastery m ON m.question_id = q.id
             WHERE q.deck_id = ? AND m.mastered = 0
+              {where_slide}
+              AND (
+                (m.question_type = 'mcq'          AND q.mcq_json IS NOT NULL) OR
+                (m.question_type = 'short_answer' AND q.short_answer_json IS NOT NULL) OR
+                (m.question_type = 'applied'      AND q.applied_json IS NOT NULL)
+              )
             ORDER BY
+                CASE m.question_type WHEN 'mcq' THEN 1 WHEN 'short_answer' THEN 2 ELSE 3 END ASC,
                 m.attempts ASC,
                 s.slide_number ASC,
-                CASE m.question_type WHEN 'mcq' THEN 1 WHEN 'short_answer' THEN 2 ELSE 3 END ASC,
                 m.avg_score ASC
             LIMIT 1
-        """, (deck_id,)).fetchone()
+        """, params).fetchone()
 
         if not row:
             return None
@@ -508,8 +520,9 @@ def update_mastery_db(question_id: int, question_type: str, score: float):
             return
         new_attempts = row["attempts"] + 1
         new_avg      = (row["avg_score"] * row["attempts"] + score) / new_attempts
-        new_streak   = (row["correct_streak"] + 1) if score >= 8 else 0
-        mastered     = 1 if (new_streak >= 3 and new_avg >= 7.5) else 0
+        new_streak    = (row["correct_streak"] + 1) if score >= 8 else 0
+        streak_needed = 1 if question_type == "mcq" else 2
+        mastered      = 1 if (new_streak >= streak_needed and new_avg >= 7.0) else 0
         conn.execute("""
             UPDATE mastery
             SET attempts=?, correct_streak=?, avg_score=?, last_score=?,
@@ -657,8 +670,11 @@ async def deck_slides(deck_id: int):
     return result
 
 @app.get("/study/next/{deck_id}")
-async def next_question(deck_id: int):
-    q = get_next_question(deck_id)
+async def next_question(deck_id: int, slide: int = None):
+    q = get_next_question(deck_id, target_slide=slide)
+    if not q:
+        # If slide filter returned nothing, fall back to global next
+        q = get_next_question(deck_id) if slide else None
     if not q:
         return {"done": True, "message": "All concepts mastered!"}
     return q
