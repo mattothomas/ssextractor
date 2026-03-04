@@ -372,9 +372,11 @@ function pollProcessing(deckId) {
     const pct = d.total_slides ? Math.round(d.processed_slides / d.total_slides * 100) : 0;
     document.getElementById('proc-bar').style.width = pct + '%';
     document.getElementById('proc-status').textContent =
-      d.status === 'done' ? 'Done! Redirecting to study...' :
-      d.status === 'error' ? 'Error during processing.' :
-      `Extracting concepts from slide ${d.processed_slides} of ${d.total_slides}...`;
+      d.status === 'done'  ? 'Done! Redirecting to study...' :
+      d.status === 'error' ? 'Error during processing. Check server logs.' :
+      d.processed_slides === 0 ? `Phase 1: Rendering slides...` :
+      pct < 50             ? `Phase 2: Grouping slides by topic...` :
+      `Phase 3: Extracting concepts & questions (${d.processed_slides}/${d.total_slides} slides)...`;
     if (d.status === 'done') {
       clearPolling();
       setTimeout(() => startStudy(deckId, d.name), 1200);
