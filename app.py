@@ -1,4 +1,4 @@
-import os, json, re, sqlite3, asyncio
+import os, json, re, sqlite3, asyncio, time
 from pathlib import Path
 from typing import Optional
 import fitz  # PyMuPDF
@@ -264,7 +264,7 @@ def group_slides_sync(slide_texts: list[dict]) -> list[dict]:
         for s in slide_texts
     )
     try:
-        msg = client.messages.create(
+        msg = _claude_with_retry(
             model="claude-haiku-4-5-20251001",
             max_tokens=4096,
             messages=[{"role": "user", "content":
@@ -293,7 +293,7 @@ def extract_concepts_sync(combined_text: list[str], image_path: str, group_label
             img_b64 = _b64.b64encode(f.read()).decode()
         text_block = "\n".join(combined_text) or "(no extractable text)"
         context = f"Topic: {group_label}\n\nCombined text from this slide group:\n{text_block}"
-        msg = client.messages.create(
+        msg = _claude_with_retry(
             model="claude-haiku-4-5-20251001",
             max_tokens=2000,
             messages=[{"role": "user", "content": [
@@ -306,6 +306,20 @@ def extract_concepts_sync(combined_text: list[str], image_path: str, group_label
         print(f"  [!] Concept extraction error ({group_label}): {e}")
         return []
 
+def _claude_with_retry(model, max_tokens, messages, retries=4, base_delay=5):
+    """Call Claude API with exponential backoff on overload/rate-limit errors."""
+    for attempt in range(retries):
+        try:
+            return client.messages.create(model=model, max_tokens=max_tokens, messages=messages)
+        except anthropic.APIStatusError as e:
+            if e.status_code in (429, 529) and attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"  [!] API overloaded (attempt {attempt+1}/{retries}), retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                raise
+    raise RuntimeError("Max retries exceeded")
+
 def generate_questions_sync(concepts: list[dict]) -> list[dict]:
     if not concepts:
         return []
@@ -314,7 +328,7 @@ def generate_questions_sync(concepts: list[dict]) -> list[dict]:
     for i in range(0, len(concepts), BATCH):
         batch = concepts[i:i + BATCH]
         try:
-            msg = client.messages.create(
+            msg = _claude_with_retry(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=4096,
                 messages=[{"role": "user", "content":
@@ -341,7 +355,7 @@ def generate_topic_overview_sync(topic_name: str, concepts: list[dict], combined
         slide_text=combined_text[:2000]
     )
     try:
-        msg = client.messages.create(
+        msg = _claude_with_retry(
             model="claude-haiku-4-5-20251001",
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
